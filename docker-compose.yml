@@ -1,0 +1,121 @@
+# FastBite - the whole platform with one command:   docker compose up -d --build --wait
+#
+# Network design
+#   edge    : normal network. ONLY the api-gateway joins it, so only port 3000 is reachable from outside.
+#   backend : "internal" network (no way in from the host, no way out to the internet).
+#             The gateway, all five services and MongoDB live here and find each other BY NAME
+#             (menu-service, order-service, mongo ...), never by localhost.
+name: fastbite
+
+x-service: &service
+  restart: unless-stopped
+  init: true                       # proper signal handling, so "docker stop" is fast and clean
+  networks: [backend]
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:?Run scripts/init-env.sh first (creates .env)}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Run scripts/init-env.sh first (creates .env)}
+      APP_DB_USER: ${MONGO_APP_USER:?Run scripts/init-env.sh first (creates .env)}
+      APP_DB_PASSWORD: ${MONGO_APP_PASSWORD:?Run scripts/init-env.sh first (creates .env)}
+    volumes:
+      - mongo-data:/data/db                                   # data survives stop / remove / recreate
+      - ./mongo-init/init-users.js:/docker-entrypoint-initdb.d/init-users.js:ro
+    networks: [backend]                                       # no published port: not reachable from outside
+    healthcheck:
+      # Logs in as the app user, so it only turns healthy AFTER first-run setup has finished.
+      test: ["CMD-SHELL", "mongosh --quiet -u \"$$APP_DB_USER\" -p \"$$APP_DB_PASSWORD\" --authenticationDatabase admin --eval \"db.adminCommand('ping').ok\" | grep -q 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  menu-service:
+    <<: *service
+    build: ./menu-service
+    image: ${DOCKERHUB_USERNAME:-local}/fastbite-menu-service:${IMAGE_TAG:-dev}
+    environment:
+      PORT: 3001
+      MONGO_URI: mongodb://${MONGO_APP_USER}:${MONGO_APP_PASSWORD}@mongo:27017/fastbite_menu?authSource=admin
+    depends_on:
+      mongo: { condition: service_healthy }
+
+  inventory-service:
+    <<: *service
+    build: ./inventory-service
+    image: ${DOCKERHUB_USERNAME:-local}/fastbite-inventory-service:${IMAGE_TAG:-dev}
+    environment:
+      PORT: 3003
+      MONGO_URI: mongodb://${MONGO_APP_USER}:${MONGO_APP_PASSWORD}@mongo:27017/fastbite_inventory?authSource=admin
+    depends_on:
+      mongo: { condition: service_healthy }
+
+  customer-service:
+    <<: *service
+    build: ./customer-service
+    image: ${DOCKERHUB_USERNAME:-local}/fastbite-customer-service:${IMAGE_TAG:-dev}
+    environment:
+      PORT: 3004
+      MONGO_URI: mongodb://${MONGO_APP_USER}:${MONGO_APP_PASSWORD}@mongo:27017/fastbite_customers?authSource=admin
+    depends_on:
+      mongo: { condition: service_healthy }
+
+  order-service:
+    <<: *service
+    build: ./order-service
+    image: ${DOCKERHUB_USERNAME:-local}/fastbite-order-service:${IMAGE_TAG:-dev}
+    environment:
+      PORT: 3002
+      MONGO_URI: mongodb://${MONGO_APP_USER}:${MONGO_APP_PASSWORD}@mongo:27017/fastbite_orders?authSource=admin
+      MENU_SERVICE_URL: http://menu-service:3001
+      INVENTORY_SERVICE_URL: http://inventory-service:3003
+      CUSTOMER_SERVICE_URL: http://customer-service:3004
+    depends_on:
+      mongo:             { condition: service_healthy }
+      menu-service:      { condition: service_healthy }
+      inventory-service: { condition: service_healthy }
+      customer-service:  { condition: service_healthy }
+
+  payment-service:
+    <<: *service
+    build: ./payment-service
+    image: ${DOCKERHUB_USERNAME:-local}/fastbite-payment-service:${IMAGE_TAG:-dev}
+    environment:
+      PORT: 3005
+      MONGO_URI: mongodb://${MONGO_APP_USER}:${MONGO_APP_PASSWORD}@mongo:27017/fastbite_payments?authSource=admin
+      ORDER_SERVICE_URL: http://order-service:3002
+    depends_on:
+      mongo:         { condition: service_healthy }
+      order-service: { condition: service_healthy }
+
+  api-gateway:
+    <<: *service
+    build: ./api-gateway
+    image: ${DOCKERHUB_USERNAME:-local}/fastbite-api-gateway:${IMAGE_TAG:-dev}
+    environment:
+      PORT: 3000
+      MENU_SERVICE_URL: http://menu-service:3001
+      ORDER_SERVICE_URL: http://order-service:3002
+      INVENTORY_SERVICE_URL: http://inventory-service:3003
+      CUSTOMER_SERVICE_URL: http://customer-service:3004
+      PAYMENT_SERVICE_URL: http://payment-service:3005
+    ports:
+      - "3000:3000"                      # the ONLY port published to the outside world
+    networks: [edge, backend]
+    depends_on:
+      menu-service:      { condition: service_healthy }
+      order-service:     { condition: service_healthy }
+      inventory-service: { condition: service_healthy }
+      customer-service:  { condition: service_healthy }
+      payment-service:   { condition: service_healthy }
+
+networks:
+  edge: {}
+  backend:
+    internal: true
+
+volumes:
+  mongo-data: {}

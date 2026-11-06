@@ -1,0 +1,7 @@
+node_modules
+# Real credentials live only in .env (never committed). .env.example is the safe template.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
